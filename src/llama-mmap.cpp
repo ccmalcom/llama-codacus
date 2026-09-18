@@ -482,6 +482,18 @@ struct llama_mmap::impl {
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
+#ifdef __linux__
+        // LLAMA_MMAP_HUGEPAGE=1: ask for huge-page (large-folio) faults on the weight mapping, so a
+        // page-cache miss reads a 2 MiB folio instead of one 4 KiB page once the kernel has given
+        // up on readahead for this mapping (experiment, see local-ai plan 2026-09-17)
+        if (const char * hp = getenv("LLAMA_MMAP_HUGEPAGE"); hp && hp[0] && hp[0] != '0') {
+            if (madvise(addr, file->size(), MADV_HUGEPAGE)) {
+                LLAMA_LOG_WARN("warning: madvise(.., MADV_HUGEPAGE) failed: %s\n", strerror(errno));
+            } else {
+                LLAMA_LOG_INFO("llama_mmap: MADV_HUGEPAGE advised on %zu MiB (LLAMA_MMAP_HUGEPAGE)\n", file->size()/1024/1024);
+            }
+        }
+#endif
 
         // page-aligned madvise over [beg, end), clamped to the file
         auto advise = [&](size_t beg, size_t end, int advice, const char * name) {
