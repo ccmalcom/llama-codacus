@@ -203,6 +203,8 @@ add_library(ggml-base
             ggml-backend-meta.cpp
             ggml-moe-prefetch.cpp
             ggml-moe-prefetch.h
+            ggml-moe-h2d-stats.cpp
+            ggml-moe-h2d-stats.h
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h

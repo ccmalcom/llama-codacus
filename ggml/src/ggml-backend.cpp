@@ -13,6 +13,7 @@
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 #include "ggml-moe-prefetch.h"
+#include "ggml-moe-h2d-stats.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -929,6 +930,14 @@ struct ggml_backend_sched {
     // consumes host threads and page cache only, no device memory
     bool moe_host_prefetch;
 
+    // overlap the selective expert H2D copy with compute by writing it into the prefetch
+    // slot ring on the prefetch backend's stream instead of into the single scheduler
+    // staging buffer on the compute stream (GGML_MOE_H2D_OVERLAP=<n_slots>). Costs one
+    // device buffer per slot beyond the first, sized to the largest offloaded expert
+    // weight; shares the slot machinery with prefetch_experts and is mutually exclusive
+    // with it, since both redirect input_cpy at the same slots.
+    bool moe_h2d_overlap;
+
     // async CPU split execution (GGML_SCHED_ASYNC_CPU); NULL when disabled
     struct ggml_sched_cpu_async * cpu_async;
 
@@ -1754,6 +1763,12 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
 static void ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched, ggml_backend_t split_backend) {
     sched->prefetch_experts = false;
+    // the slot-ring overlap policy lives on the same slots; if they could not be allocated
+    // it has to fall back to the compute-stream copy too, once, rather than retry per split
+    if (sched->moe_h2d_overlap) {
+        GGML_LOG_WARN("%s: expert H2D overlap disabled: slot allocation failed\n", __func__);
+        sched->moe_h2d_overlap = false;
+    }
     if (sched->prefetch_backend) {
         ggml_backend_synchronize(split_backend);
         ggml_backend_synchronize(sched->prefetch_backend);
@@ -1765,9 +1780,19 @@ static void ggml_backend_sched_prefetch_disable(ggml_backend_sched_t sched, ggml
     }
 }
 
-// slots are sized once for the largest offloaded expert tensor in the current graph so
-// that they never need to grow mid-eval
-static size_t ggml_backend_sched_prefetch_max_size(ggml_backend_sched_t sched) {
+// Slots are sized once for the largest offloaded expert tensor in the current graph so
+// that they never need to grow mid-eval.
+//
+// The size must be the backend's *allocation* size, not ggml_nbytes: for a quantized
+// tensor whose ne[0] is not a multiple of MATRIX_ROW_PADDING the CUDA buffer type appends
+// a padded row ([TAG_ALLOC_SIZE_EXPAND] in ggml-cuda.cu), and the MMQ path reads it. Here
+// ffn_down_exps is IQ4_NL with ne[0] = 640, so it needs 384 elements of padding that
+// ggml_nbytes does not include; a slot sized by ggml_nbytes makes the first expert matmul
+// read past the end of the buffer. That is the "illegal memory access" the B1u128 arm of
+// docs/nvme-tier-results.md hit after its third slot failed to allocate, which was
+// recorded there as an OOM: the OOM degraded gracefully, the undersized slot did not.
+static size_t ggml_backend_sched_prefetch_max_size(ggml_backend_sched_t sched,
+                                                   ggml_backend_buffer_type_t buft) {
     size_t max_size = 0;
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &sched->splits[split_id];
@@ -1779,7 +1804,7 @@ static size_t ggml_backend_sched_prefetch_max_size(ggml_backend_sched_t sched) {
             if (input->buffer &&
                 ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                 ggml_backend_buffer_is_host(input->buffer)) {
-                max_size = std::max(max_size, ggml_nbytes(input));
+                max_size = std::max(max_size, ggml_backend_buft_get_alloc_size(buft, input));
             }
         }
     }
@@ -1793,11 +1818,13 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
         ggml_backend_dev_get_props(dev, &props);
         if (!props.caps.async || !props.caps.events) {
             sched->prefetch_experts = false;
+            sched->moe_h2d_overlap  = false;
             return false;
         }
         sched->prefetch_backend = ggml_backend_dev_init(dev, NULL);
         if (sched->prefetch_backend == NULL) {
             sched->prefetch_experts = false;
+            sched->moe_h2d_overlap  = false;
             return false;
         }
         for (int i = 0; i < sched->prefetch_n_slots; i++) {
@@ -1805,14 +1832,14 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
             sched->prefetch_free[i]  = ggml_backend_event_new(dev);
             if (sched->prefetch_ready[i] == NULL || sched->prefetch_free[i] == NULL) {
                 sched->prefetch_experts = false;
+                sched->moe_h2d_overlap  = false;
                 return false;
             }
         }
     }
 
-    size = std::max(size, ggml_backend_sched_prefetch_max_size(sched));
-
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(split_backend);
+    size = std::max(size, ggml_backend_sched_prefetch_max_size(sched, buft));
     for (int i = 0; i < sched->prefetch_n_slots; i++) {
         if (sched->prefetch_slots[i] == NULL || ggml_backend_buffer_get_size(sched->prefetch_slots[i]) < size) {
             // allocate before freeing so a failure leaves the old slot intact
@@ -1833,6 +1860,18 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
                 ggml_backend_synchronize(sched->prefetch_backend);
                 ggml_backend_buffer_free(sched->prefetch_slots[i]);
             }
+            // The selective copy writes only the selected experts and never the row padding
+            // at the end of a padded quantized tensor, which MMQ reads. A tensor allocated
+            // the normal way gets that padding zeroed by the backend's init_tensor; a slot
+            // we repoint input_cpy->data at does not, so zero it once here. Measured as not
+            // load-bearing on this model (the digest is unchanged with and without), but it
+            // costs one memset per slot and removes a NaN source.
+            ggml_backend_buffer_clear(new_buf, 0);
+            // Match the usage of the scheduler's own compute buffer. ggml-cuda keys its
+            // cuBLAS-vs-MMQ choice for a padded quantized src0 on this flag
+            // (bad_padding_clear, ggml-cuda.cu), so a slot with a different usage would send
+            // the same weights down a different kernel and give different bits.
+            ggml_backend_buffer_set_usage(new_buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
             sched->prefetch_slots[i] = new_buf;
             sched->prefetch_used[i] = false;
         }
@@ -1858,6 +1897,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // once per graph, however many splits of this pass reference it
         ggml_moe_prefetch_new_epoch();
     }
+
+    const double t_pass0 = ggml_moe_h2d_stats_enabled() ? ggml_moe_h2d_now() : 0.0;
 
     int prev_backend_id = -1;
 
@@ -1946,11 +1987,48 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                 }
 
-                // wait for the split backend to finish using the input before overwriting it
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
+                // GGML_MOE_H2D_OVERLAP: the selective expert copy below writes into a ring
+                // of device slots on a second stream instead of into the one scheduler-owned
+                // staging buffer on the compute stream. The measurement that motivates it:
+                // every offloaded expert weight of every layer lands in the *same* device
+                // buffer (destination reuse was 100 % at distances 1-4 over 15,369 copies),
+                // so today a copy cannot begin until the previous split's matmul has finished
+                // reading that buffer -- and with n_copies == 1 the branch below is a full
+                // host-blocking drain of the compute stream before every copy. One extra slot
+                // breaks that: the copy of this weight proceeds on the copy stream while the
+                // previous weight's matmul still reads its own slot.
+                //
+                // Only the destination and the stream change. The bytes copied, the ranges,
+                // the routing mask and the host prefetch are identical to the default path,
+                // which is what makes the routing digest a usable oracle across the two.
+                bool sel_overlap = false;
+                if (sched->moe_h2d_overlap && !sched->callback_eval && split_prefetch_slot == -1 &&
+                    split->graph.n_nodes > 0) {
+                    ggml_tensor * n0 = split->graph.nodes[0];
+                    if (n0->op == GGML_OP_MUL_MAT_ID && n0->src[0] == input_cpy &&
+                        ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                        ggml_backend_buffer_is_host(input->buffer) &&
+                        ggml_backend_sched_prefetch_init(sched, split_backend, ggml_nbytes(input))) {
+                        sel_overlap = true;
+                    }
+                }
+
+                if (!sel_overlap) {
+                    if (split_prefetch_slot != -1 && ggml_moe_h2d_stats_enabled()) {
+                        // a later input of a split whose weight copy is already on the copy
+                        // stream: this drain waits for that copy and cancels the overlap
+                        ggml_moe_h2d_note_drain_after_slot();
+                    }
+                    // wait for the split backend to finish using the input before overwriting it
+                    const double t_wait0 = ggml_moe_h2d_stats_enabled() ? ggml_moe_h2d_now() : 0.0;
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
+                    if (ggml_moe_h2d_stats_enabled()) {
+                        ggml_moe_h2d_add(GGML_MOE_H2D_WAIT_PREV, ggml_moe_h2d_now() - t_wait0);
+                    }
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -1982,9 +2060,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 
                     if (ids_tensor != prev_ids_tensor) {
+                        const double t_ids0 = ggml_moe_h2d_stats_enabled() ? ggml_moe_h2d_now() : 0.0;
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                         ggml_backend_synchronize(ids_backend);
+                        if (ggml_moe_h2d_stats_enabled()) {
+                            ggml_moe_h2d_add(GGML_MOE_H2D_IDS, ggml_moe_h2d_now() - t_ids0);
+                        }
 
                         // find the used experts
                         used_ids.clear();
@@ -2001,6 +2083,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
 
                         prev_ids_tensor = ids_tensor;
+
+                        if (ggml_moe_route_digest_enabled()) {
+                            // fold this layer's selection, not the copy's bytes: the oracle for
+                            // "were the same experts chosen", independent of sampling, of the
+                            // output text and of whether the prefetch pool is running
+                            ggml_moe_route_fold(used_ids.data(), (int) used_ids.size(),
+                                                (int) n_expert);
+                        }
 
                         if (sched->moe_host_prefetch) {
                             // the routing for this layer is now host-visible. The other expert
@@ -2038,9 +2128,43 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // the pageable copies below read warm page cache instead of faulting
                         // one page at a time on this thread. 512 covers the padding read past
                         // the last expert of each run by copy_experts.
+                        const double t_pf0 = ggml_moe_h2d_stats_enabled() ? ggml_moe_h2d_now() : 0.0;
                         ggml_moe_prefetch_mask(input, used_ids.data(), n_expert, 512);
                         ggml_moe_prefetch_wait(input);
+                        if (ggml_moe_h2d_stats_enabled()) {
+                            ggml_moe_h2d_add(GGML_MOE_H2D_PREFETCH, ggml_moe_h2d_now() - t_pf0);
+                        }
                     }
+
+                    // acquire the slot only now, after the routing is known and the host pages
+                    // are resident, so a slot is held for the copy and not for the wait
+                    ggml_backend_t copy_backend = split_backend;
+                    if (sel_overlap) {
+                        const int slot = sched->prefetch_cur;
+                        sched->prefetch_cur = (sched->prefetch_cur + 1) % sched->prefetch_n_slots;
+                        // the copy stream must not overwrite a slot whose previous occupant's
+                        // matmul is still reading it
+                        const double t_slot0 = ggml_moe_h2d_stats_enabled() ? ggml_moe_h2d_now() : 0.0;
+                        if (sched->prefetch_used[slot]) {
+                            ggml_backend_event_wait(sched->prefetch_backend, sched->prefetch_free[slot]);
+                        }
+                        if (ggml_moe_h2d_stats_enabled()) {
+                            ggml_moe_h2d_add(GGML_MOE_H2D_WAIT_PREV, ggml_moe_h2d_now() - t_slot0);
+                        }
+                        // redirect the destination for the duration of this split only; the
+                        // restore after the graph launch is the existing prefetch path's
+                        prefetch_input_cpy    = input_cpy;
+                        prefetch_saved_buffer = input_cpy->buffer;
+                        prefetch_saved_data   = input_cpy->data;
+                        input_cpy->buffer = sched->prefetch_slots[slot];
+                        input_cpy->data   = ggml_backend_buffer_get_base(sched->prefetch_slots[slot]);
+                        split_prefetch_slot = slot;
+                        copy_backend = sched->prefetch_backend;
+                    }
+
+                    size_t stat_ranges = 0;
+                    size_t stat_bytes  = 0;
+                    const double t_cpy0 = ggml_moe_h2d_stats_enabled() ? ggml_moe_h2d_now() : 0.0;
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
@@ -2049,12 +2173,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
-                        ggml_backend_tensor_set_async(split_backend,
+                        ggml_backend_tensor_set_async(copy_backend,
                             input_cpy,
                             (const uint8_t *)input->data + expert_offset, expert_offset,
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
+
+                        if (ggml_moe_h2d_stats_enabled() || ggml_moe_route_digest_enabled()) {
+                            stat_ranges += 1;
+                            stat_bytes  += expert_size_copy + padding_end;
+                            ggml_moe_route_fold_range(first_id, last_id,
+                                                      expert_size_copy + padding_end);
+                        }
                     };
 
                     int id = 0;
@@ -2080,6 +2211,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         last_id = id;
                     }
                     copy_experts(first_id, last_id);
+
+                    if (sel_overlap) {
+                        // publish the slot to the compute stream; the matmul launched below
+                        // will not start before the last range has landed
+                        ggml_backend_event_record(sched->prefetch_ready[split_prefetch_slot],
+                                                  sched->prefetch_backend);
+                        ggml_backend_event_wait(split_backend,
+                                                sched->prefetch_ready[split_prefetch_slot]);
+                    }
+
+                    if (ggml_moe_h2d_stats_enabled()) {
+                        // issue time only: no synchronize is added here, so the measurement
+                        // does not perturb the thing measured. A pageable cudaMemcpyAsync is
+                        // driver-staged and largely blocking, so most of the DMA lands in this
+                        // bucket; whatever does not lands in the next split's wait_prev_compute,
+                        // which is where the thread actually pays for it.
+                        ggml_moe_h2d_add(GGML_MOE_H2D_COPY, ggml_moe_h2d_now() - t_cpy0);
+                        ggml_moe_h2d_copy_done(stat_ranges, stat_bytes,
+                                               input_cpy->data, ggml_nbytes(input_cpy));
+                    }
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
@@ -2161,6 +2312,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         if (ec != GGML_STATUS_SUCCESS) {
             return ec;
         }
+    }
+
+    if (ggml_moe_h2d_stats_enabled()) {
+        ggml_moe_h2d_pass(ggml_moe_h2d_now() - t_pass0);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -2251,6 +2406,17 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->moe_host_prefetch = ggml_moe_prefetch_enabled();
     }
 
+    // GGML_MOE_H2D_OVERLAP=<n_slots> routes the selective expert copy through the slot ring
+    // on a second stream. Overlap needs at least two slots to mean anything, so 1 is read as
+    // 2. It takes precedence over GGML_SCHED_PREFETCH_EXPERTS, which copies whole tensors
+    // into the same slots: enabling both would have the two policies fight over prefetch_cur.
+    sched->moe_h2d_overlap = false;
+    if (const char * env = getenv("GGML_MOE_H2D_OVERLAP"); env && atoi(env) > 0 && op_offload) {
+        sched->moe_h2d_overlap = true;
+        sched->prefetch_experts = false;
+        sched->prefetch_n_slots = std::min(std::max(atoi(env), 2), GGML_SCHED_MAX_PREFETCH_SLOTS);
+    }
+
 
     ggml_backend_sched_reset(sched);
 
@@ -2269,6 +2435,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
     }
+    ggml_moe_h2d_report();
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
