@@ -12,6 +12,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-moe-prefetch.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -922,6 +923,11 @@ struct ggml_backend_sched {
     ggml_backend_event_t prefetch_free[GGML_SCHED_MAX_PREFETCH_SLOTS];
     bool prefetch_used[GGML_SCHED_MAX_PREFETCH_SLOTS];
     int prefetch_cur;
+
+    // selective host-side page-cache population of the routed experts of offloaded
+    // MUL_MAT_ID weights before their H2D copy (GGML_MOE_HOST_PREFETCH=<n_threads>);
+    // consumes host threads and page cache only, no device memory
+    bool moe_host_prefetch;
 
     // async CPU split execution (GGML_SCHED_ASYNC_CPU); NULL when disabled
     struct ggml_sched_cpu_async * cpu_async;
@@ -1847,6 +1853,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
 
+    if (sched->moe_host_prefetch) {
+        // one epoch per scheduler pass: a weight's selected rows are enqueued at most
+        // once per graph, however many splits of this pass reference it
+        ggml_moe_prefetch_new_epoch();
+    }
+
     int prev_backend_id = -1;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -1989,6 +2001,45 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
 
                         prev_ids_tensor = ids_tensor;
+
+                        if (sched->moe_host_prefetch) {
+                            // the routing for this layer is now host-visible. The other expert
+                            // weights of the same layer (up/down after gate) arrive as inputs of the
+                            // next splits and share this ids tensor; enqueue their selected rows now,
+                            // farthest first, so they stream from storage while this weight is
+                            // copied H2D and computed. This weight itself is enqueued below and, being
+                            // enqueued last, sits at the head of the queue. Nothing here looks past
+                            // the routing that already exists: no future layer is touched.
+                            const int scan_end = std::min(sched->n_splits, split_id + 1 + 8);
+                            for (int k = scan_end - 1; k > split_id; k--) {
+                                struct ggml_backend_sched_split * ns = &splits[k];
+                                if (ns->graph.n_nodes == 0) {
+                                    continue;
+                                }
+                                ggml_tensor * nn = ns->graph.nodes[0];
+                                if (nn->op != GGML_OP_MUL_MAT_ID || nn->src[2] != node->src[2]) {
+                                    continue;
+                                }
+                                for (int m = 0; m < ns->n_inputs; m++) {
+                                    ggml_tensor * ni = ns->inputs[m];
+                                    if (nn->src[0] == tensor_copy(ni, ns->backend_id, sched->cur_copy) &&
+                                        ggml_backend_buffer_get_usage(ni->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                                        ggml_backend_buffer_is_host(ni->buffer)) {
+                                        ggml_moe_prefetch_mask(ni, used_ids.data(), n_expert, 512);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (sched->moe_host_prefetch) {
+                        // enqueue this weight's selected rows (a no-op when the same-layer scan
+                        // of an earlier split already did) and block until they are resident, so
+                        // the pageable copies below read warm page cache instead of faulting
+                        // one page at a time on this thread. 512 covers the padding read past
+                        // the last expert of each run by copy_experts.
+                        ggml_moe_prefetch_mask(input, used_ids.data(), n_expert, 512);
+                        ggml_moe_prefetch_wait(input);
                     }
 
                     // group consecutive experts and copy them together
@@ -2191,10 +2242,27 @@ ggml_backend_sched_t ggml_backend_sched_new(
     // default of 3 covers the gate/up/down expert tensors of one MoE layer
     sched->prefetch_n_slots = prefetch_n_slots <= 1 ? 3 : std::min(prefetch_n_slots, GGML_SCHED_MAX_PREFETCH_SLOTS);
 
+    // GGML_MOE_HOST_PREFETCH=N starts N host worker threads that populate the page cache
+    // with the routed experts of each offloaded MUL_MAT_ID weight before its H2D copy.
+    // Unset or 0 leaves the pool uncreated and every hook below compiled to one false branch.
+    sched->moe_host_prefetch = false;
+    if (const char * env = getenv("GGML_MOE_HOST_PREFETCH"); env && atoi(env) > 0 && op_offload) {
+        ggml_moe_prefetch_set_n_threads(atoi(env));
+        sched->moe_host_prefetch = ggml_moe_prefetch_enabled();
+    }
+
 
     ggml_backend_sched_reset(sched);
 
     return sched;
+}
+
+void ggml_backend_moe_prefetch_register_mapping(const void * base, size_t size) {
+    ggml_moe_prefetch_register_mapping(base, size);
+}
+
+void ggml_backend_moe_prefetch_unregister_mapping(const void * base) {
+    ggml_moe_prefetch_unregister_mapping(base);
 }
 
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {

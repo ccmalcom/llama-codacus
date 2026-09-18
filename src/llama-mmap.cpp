@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <cstring>
 #include <climits>
@@ -524,6 +525,10 @@ struct llama_mmap::impl {
         }
 
         mapped_fragments.emplace_back(0, file->size());
+
+        // lets the scheduler's opt-in host expert prefetch (GGML_MOE_HOST_PREFETCH)
+        // recognise tensors that live in this mapping; a registry entry only
+        ggml_backend_moe_prefetch_register_mapping(addr, file->size());
     }
 
     static void align_range(size_t * first, size_t * last, size_t page_size) {
@@ -575,6 +580,7 @@ struct llama_mmap::impl {
     }
 
     ~impl() {
+        ggml_backend_moe_prefetch_unregister_mapping(addr);
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
                 LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));

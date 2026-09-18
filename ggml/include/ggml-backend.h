@@ -340,6 +340,12 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_async_cpu(ggml_backend_sched_t sched, bool enable);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
+    // selective host-side page-cache population of mmap'd MoE expert weights
+    // (experimental, opt-in with GGML_MOE_HOST_PREFETCH=<n_threads>): only tensors
+    // inside a registered mapping are ever touched. No-ops when the pool is off.
+    GGML_API void                 ggml_backend_moe_prefetch_register_mapping  (const void * base, size_t size);
+    GGML_API void                 ggml_backend_moe_prefetch_unregister_mapping(const void * base);
+
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
