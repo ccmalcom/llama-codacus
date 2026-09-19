@@ -14,6 +14,13 @@
 //
 // Opt-in: the pool only exists when the scheduler was told to create it
 // (GGML_MOE_HOST_PREFETCH=<n_threads>); every entry point is a no-op otherwise.
+//
+// Diagnostics, all off by default; none of them changes what is populated:
+//   GGML_MOE_PREFETCH_DEBUG=1|2            cumulative counters / per-enqueue lines
+//   GGML_MOE_RESIDENCY_TOPOLOGY=1          describe each chunk's resident/missing page
+//                                          pattern from the mincore vector the skip test
+//                                          already fetches, and time its MADV_POPULATE_READ
+//   GGML_MOE_RESIDENCY_TOPOLOGY_OUT=<path> where that lands as JSON (else stderr only)
 
 #include "ggml.h"
 
