@@ -34,6 +34,111 @@
 #endif
 
 
+// ---------------------------------------------------------------------------
+// Round 13 diagnostics: batch=1 MoE expert offload.
+//
+// Lowering GGML_OP_OFFLOAD_MIN_BATCH to 1 lets decode's MUL_MAT_ID (ne[2]==1)
+// take the expert-offload path, and that path aborts partway through a
+// generation on the bounds assert in ggml_backend_tensor_set_async. The assert
+// is correct and is not touched; this only makes the abort say *which* tensor,
+// which layer, which experts and which batch size produced it, and logs the
+// routing state that the copy loop was handed.
+//
+// GGML_MOE_DECODE_TRACE=1 additionally traces every selective expert copy,
+// including the ones that do not abort, so the healthy and the failing case can
+// be compared. Off by default; all of this is inert without the env var except
+// the out-of-bounds dump, which only ever runs on a path that is about to die.
+// ---------------------------------------------------------------------------
+
+struct ggml_moe_dbg_state {
+    long long eval        = -1;   // ggml_backend_sched_compute_splits call index
+    int     split_id      = -1;
+    int     n_splits      = 0;
+    const char * site     = "none";
+    const char * node_name  = "";
+    const char * input_name = "";
+    int     node_op       = -1;
+    long long node_ne2    = -1;   // the value get_op_batch_size() feeds the offload predicate
+    long long n_expert    = -1;
+    size_t  expert_size   = 0;
+    long long ids_ne0     = -1;
+    long long ids_ne1     = -1;
+    int     n_used        = -1;   // popcount of the pack's used-expert bitset
+    int     max_used      = -1;
+    int     bitset_words  = -1;
+    long long first_id    = -1;
+    long long last_id     = -1;
+    size_t  padding_end   = 0;
+    int     slot          = -1;
+};
+
+static ggml_moe_dbg_state g_moe_dbg;
+static long long          g_moe_dbg_eval = 0;
+static long long          g_moe_empty_packs = 0;   // packs that received no routed expert
+
+static bool ggml_moe_decode_trace_enabled(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("GGML_MOE_DECODE_TRACE");
+        on = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    return on != 0;
+}
+
+static void ggml_moe_dbg_dump_tensor(const char * what, const struct ggml_tensor * t) {
+    if (t == NULL) {
+        GGML_LOG_ERROR("  %-12s (null)\n", what);
+        return;
+    }
+    GGML_LOG_ERROR("  %-12s name='%s' type=%s ne=[%lld,%lld,%lld,%lld] nb=[%zu,%zu,%zu,%zu]\n",
+        what, t->name, ggml_type_name(t->type),
+        (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+        t->nb[0], t->nb[1], t->nb[2], t->nb[3]);
+    GGML_LOG_ERROR("  %-12s ggml_nbytes=%zu blck=%d type_size=%zu data=%p\n",
+        "", ggml_nbytes(t), (int) ggml_blck_size(t->type), ggml_type_size(t->type), (void *) t->data);
+    if (t->buffer) {
+        ggml_backend_buffer_type_t bt = ggml_backend_buffer_get_type(t->buffer);
+        GGML_LOG_ERROR("  %-12s buffer='%s' buft='%s' size=%zu usage=%d host=%d base=%p alloc_size=%zu\n",
+            "", ggml_backend_buffer_name(t->buffer), ggml_backend_buft_name(bt),
+            ggml_backend_buffer_get_size(t->buffer), (int) ggml_backend_buffer_get_usage(t->buffer),
+            (int) ggml_backend_buffer_is_host(t->buffer),
+            ggml_backend_buffer_get_base(t->buffer),
+            ggml_backend_buft_get_alloc_size(bt, t));
+    } else {
+        GGML_LOG_ERROR("  %-12s buffer=(none)\n", "");
+    }
+}
+
+// called immediately before the bounds GGML_ASSERT would fire
+static void ggml_moe_dbg_dump_oob(const char * fn, ggml_backend_t backend,
+                                  const struct ggml_tensor * tensor, size_t offset, size_t size) {
+    const ggml_moe_dbg_state & d = g_moe_dbg;
+    GGML_LOG_ERROR("\n================ MoE offload out-of-bounds tensor write ================\n");
+    GGML_LOG_ERROR("  %s: backend='%s'\n", fn, backend ? ggml_backend_name(backend) : "(null)");
+    GGML_LOG_ERROR("  offset=%zu size=%zu offset+size=%zu ggml_nbytes=%zu overrun=%lld\n",
+        offset, size, offset + size, ggml_nbytes(tensor),
+        (long long) (offset + size) - (long long) ggml_nbytes(tensor));
+    ggml_moe_dbg_dump_tensor("destination", tensor);
+    GGML_LOG_ERROR("  -- scheduler context --\n");
+    GGML_LOG_ERROR("  eval=%lld split=%d/%d site=%s slot=%d\n",
+        d.eval, d.split_id, d.n_splits, d.site, d.slot);
+    GGML_LOG_ERROR("  node='%s' op=%d batch_size(ne[2])=%lld   <-- offload predicate input\n",
+        d.node_name, d.node_op, d.node_ne2);
+    GGML_LOG_ERROR("  source weight='%s' n_expert(ne[2])=%lld expert_size(nb[2])=%zu\n",
+        d.input_name, d.n_expert, d.expert_size);
+    GGML_LOG_ERROR("  ids ne=[%lld,%lld]  used_experts=%d max_used_id=%d bitset_words=%d\n",
+        d.ids_ne0, d.ids_ne1, d.n_used, d.max_used, d.bitset_words);
+    GGML_LOG_ERROR("  copy_experts(first_id=%lld, last_id=%lld) padding_end=%zu\n",
+        d.first_id, d.last_id, d.padding_end);
+    if (d.n_used == 0) {
+        GGML_LOG_ERROR("  ** the pack's used-expert bitset is EMPTY: no expert of this weight was\n");
+        GGML_LOG_ERROR("  ** routed for this ubatch, so the first_id scan ran off the end of the\n");
+        GGML_LOG_ERROR("  ** bitset and first_id is heap garbage.\n");
+    }
+    GGML_LOG_ERROR("========================================================================\n\n");
+}
+
+
 // backend buffer type
 
 const char * ggml_backend_buft_name(ggml_backend_buffer_type_t buft) {
@@ -271,6 +376,9 @@ void ggml_backend_tensor_set_async(ggml_backend_t backend, struct ggml_tensor * 
     GGML_ASSERT(backend);
     GGML_ASSERT(tensor);
     GGML_ASSERT(tensor->data != NULL && "tensor not allocated");
+    if (offset + size > ggml_nbytes(tensor)) {
+        ggml_moe_dbg_dump_oob(__func__, backend, tensor, offset, size);
+    }
     GGML_ASSERT(offset + size <= ggml_nbytes(tensor) && "tensor write out of bounds");
 
     if (backend->iface.set_tensor_async == NULL) {
@@ -1866,6 +1974,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
 
+    g_moe_dbg = ggml_moe_dbg_state();
+    g_moe_dbg.eval     = g_moe_dbg_eval++;
+    g_moe_dbg.n_splits = sched->n_splits;
+
     if (sched->cpu_async) {
         // a job left over from an aborted eval references stale split memory - drain it
         sched->cpu_async->join();
@@ -1961,6 +2073,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             prefetch_saved_data   = input_cpy->data;
                             input_cpy->buffer = sched->prefetch_slots[slot];
                             input_cpy->data   = ggml_backend_buffer_get_base(sched->prefetch_slots[slot]);
+                            g_moe_dbg.split_id   = split_id;
+                            g_moe_dbg.site       = "prefetch_slot_full_tensor";
+                            g_moe_dbg.slot       = slot;
+                            g_moe_dbg.node_name  = node->name;
+                            g_moe_dbg.node_op    = (int) node->op;
+                            g_moe_dbg.node_ne2   = (long long) node->ne[2];
+                            g_moe_dbg.input_name = input->name;
+                            g_moe_dbg.n_expert   = (long long) n_expert;
                             ggml_backend_tensor_set_async(sched->prefetch_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                             ggml_backend_event_record(sched->prefetch_ready[slot], sched->prefetch_backend);
                             ggml_backend_event_wait(split_backend, sched->prefetch_ready[slot]);
@@ -1997,6 +2117,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
                     const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+
+                    g_moe_dbg.split_id    = split_id;
+                    g_moe_dbg.site        = "copy_experts";
+                    g_moe_dbg.node_name   = node->name;
+                    g_moe_dbg.node_op     = (int) node->op;
+                    g_moe_dbg.node_ne2    = (long long) node->ne[2];
+                    g_moe_dbg.input_name  = input->name;
+                    g_moe_dbg.n_expert    = (long long) n_expert;
+                    g_moe_dbg.expert_size = expert_size;
 
                     ggml_backend_synchronize(input_backend);
 
@@ -2038,6 +2167,45 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
 
                         prev_ids_tensor = ids_tensor;
+
+                        {
+                            int n_used = 0, max_used = -1;
+                            for (int64_t e = 0; e < n_expert; e++) {
+                                if (ggml_bitset_get(used_ids.data(), e)) { n_used++; max_used = (int) e; }
+                            }
+                            g_moe_dbg.ids_ne0      = (long long) ids_tensor->ne[0];
+                            g_moe_dbg.ids_ne1      = (long long) ids_tensor->ne[1];
+                            g_moe_dbg.n_used       = n_used;
+                            g_moe_dbg.max_used     = max_used;
+                            g_moe_dbg.bitset_words = (int) used_ids.size();
+                            if (n_used == 0) {
+                                // normal and handled: every expert this ubatch selected
+                                // lives in the other pack, so this weight contributes
+                                // nothing and nothing is copied. Kept always-on and
+                                // countable because how often it happens is the measure of
+                                // how exposed the unguarded scan used to be.
+                                // stderr, not GGML_LOG_INFO: llama-server filters ggml's
+                                // INFO level out of its log entirely, which is why the
+                                // model's own "expert cache:" line never appears in a run
+                                // log either. Every other MoE counter in this tree
+                                // (moe-h2d, moe-route-digest, moe-host-prefetch) writes to
+                                // stderr for the same reason.
+                                g_moe_empty_packs++;
+                                fprintf(stderr, "moe-decode: empty pack (nothing to copy) eval=%lld split=%d "
+                                        "node='%s' batch=%lld weight='%s' n_expert=%lld ids=[%lld,%lld] "
+                                        "total=%lld\n",
+                                        g_moe_dbg.eval, split_id, node->name,
+                                        (long long) node->ne[2], input->name, (long long) n_expert,
+                                        (long long) ids_tensor->ne[0], (long long) ids_tensor->ne[1],
+                                        g_moe_empty_packs);
+                            } else if (ggml_moe_decode_trace_enabled() && node->ne[2] <= 2) {
+                                fprintf(stderr, "moe-decode: eval=%lld split=%d node='%s' batch=%lld "
+                                        "weight='%s' n_expert=%lld used=%d max_id=%d\n",
+                                        g_moe_dbg.eval, split_id, node->name,
+                                        (long long) node->ne[2], input->name,
+                                        (long long) n_expert, n_used, max_used);
+                            }
+                        }
 
                         if (ggml_moe_route_digest_enabled()) {
                             // fold this layer's selection, not the copy's bytes: the oracle for
@@ -2097,10 +2265,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
+                        // the destination is sized for exactly n_expert experts, so a range
+                        // outside [0, n_expert) is a routing/scan bug and is caught here,
+                        // where the expert ids are still in scope, rather than as an
+                        // anonymous out-of-bounds write inside the backend
+                        GGML_ASSERT(first_id >= 0 && first_id <= last_id && last_id < n_expert &&
+                                    "expert copy range outside the weight");
                         const size_t expert_offset = first_id * expert_size;
                         const size_t expert_size_copy =  (last_id - first_id + 1) * expert_size;
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
+
+                        g_moe_dbg.first_id    = first_id;
+                        g_moe_dbg.last_id     = last_id;
+                        g_moe_dbg.padding_end = padding_end;
 
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
@@ -2117,29 +2295,69 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
                     };
 
+                    // Find this pack's first routed expert. The scan must be bounded by
+                    // n_expert: the bitset can legitimately be empty. With the hot/cold
+                    // expert cache (--moe-cache-slots) a pack's ids are all -1 when every
+                    // expert the ubatch selected lives in the *other* pack, and the loop
+                    // above skips ids < 0, so not one bit is set. ggml_bitset_get does no
+                    // bounds check (ggml-impl.h), so an unbounded scan walks off the end of
+                    // used_ids into the heap and returns a first_id >= n_expert, which
+                    // copy_experts then turns into a write past the end of the destination.
+                    //
+                    // An empty pack is a designed-for state, not an error: ggml-cuda's
+                    // mul_mat_id zeroes the dst rows of skipped ids (mmid.cu,
+                    // mm_ids_zero_skipped_rows) so the hot and cold chains' outputs still
+                    // add to the exact single-tensor result, and the matmul reads no expert
+                    // row of this weight. So there is nothing to copy, and copying nothing
+                    // is the whole correct payload.
+                    //
+                    // It was unreachable until decode was allowed to offload. A prefill
+                    // ubatch of 256 tokens offers n_expert_used*256 chances for a pack to be
+                    // hit and essentially always hits both; a decode step offers
+                    // n_expert_used. The neighbouring host-prefetch scan
+                    // (collect_mask_ranges, ggml-moe-prefetch.cpp) already bounds itself the
+                    // same way.
+                    // used_ids is rebuilt only when the ids tensor changes, so n_expert
+                    // alone is not the quantity that backs the read: bound by the bitset's
+                    // own length too. Equal here (every cold pack of a layer has the same
+                    // n_expert), but the bug being fixed was exactly an assumption about
+                    // this loop's bound, so the bound is made to name what it indexes.
+                    const int64_t scan_end = std::min<int64_t>(n_expert, (int64_t) used_ids.size() << 5);
                     int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
+                    while (id < scan_end && !ggml_bitset_get(used_ids.data(), id)) {
                         id++;
                     }
-                    int32_t first_id = id;
-                    int32_t last_id = first_id;
+                    const bool any_routed = id < scan_end;
 
-                    for (++id; id < n_expert; ++id) {
-                        if (!ggml_bitset_get(used_ids.data(), id)) {
-                            continue;
-                        }
-
-                        if (id == last_id + 1) {
-                            last_id = id;
-                            continue;
-                        }
-
-                        copy_experts(first_id, last_id);
-
-                        first_id = id;
-                        last_id = id;
+                    if (!any_routed) {
+                        // do not leave the previous split's range in the breadcrumb: a
+                        // later out-of-bounds dump would print a plausible but wrong
+                        // copy_experts() range for a copy that never happened
+                        g_moe_dbg.first_id = g_moe_dbg.last_id = -1;
+                        g_moe_dbg.padding_end = 0;
                     }
-                    copy_experts(first_id, last_id);
+
+                    if (any_routed) {
+                        int32_t first_id = id;
+                        int32_t last_id = first_id;
+
+                        for (++id; id < n_expert; ++id) {
+                            if (!ggml_bitset_get(used_ids.data(), id)) {
+                                continue;
+                            }
+
+                            if (id == last_id + 1) {
+                                last_id = id;
+                                continue;
+                            }
+
+                            copy_experts(first_id, last_id);
+
+                            first_id = id;
+                            last_id = id;
+                        }
+                        copy_experts(first_id, last_id);
+                    }
 
                     if (ggml_moe_h2d_stats_enabled()) {
                         // issue time only: no synchronize is added here, so the measurement
