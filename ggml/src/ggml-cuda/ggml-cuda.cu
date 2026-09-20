@@ -1,6 +1,7 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "../ggml-moe-timeline.h"
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -4501,6 +4502,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 #endif // USE_CUDA_GRAPH
+
+    if (ggml_moe_tl_enabled()) {
+        // Round 16: `launch` is 20 % of a decode token, and whether that is reducible
+        // turns on whether these calls are replaying a captured graph or launching every
+        // kernel individually. Counted rather than assumed.
+        ggml_moe_tl_note_cuda_graph(use_cuda_graph ? 1 : 0);
+    }
 
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture

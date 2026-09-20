@@ -14,6 +14,7 @@
 #include "ggml-impl.h"
 #include "ggml-moe-prefetch.h"
 #include "ggml-moe-h2d-stats.h"
+#include "ggml-moe-timeline.h"
 #include "ggml-moe-cache.h"
 
 #include <assert.h>
@@ -1997,6 +1998,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     const double t_pass0 = ggml_moe_h2d_stats_enabled() ? ggml_moe_h2d_now() : 0.0;
 
+    // Round 16: the whole-pass decomposition. Opened here so every bucket below lands in
+    // this pass, and closed after the split loop; the end-of-eval drain is added by
+    // ggml_backend_sched_synchronize, which runs after this function returns.
+    const int    tl     = ggml_moe_tl_enabled();
+    const double t_tl0  = tl ? ggml_moe_tl_now() : 0.0;
+    int          tl_nodes = 0;
+    if (tl) {
+        ggml_moe_tl_pass_begin();
+        ggml_moe_tl_note_sched(sched->n_copies,
+                               sched->events[0][sched->cur_copy] != NULL);
+    }
+
     int prev_backend_id = -1;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
@@ -2017,7 +2030,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 must_join = input_backend == sched->backends[sched->n_backends - 1];
             }
             if (must_join) {
+                const double t_cj0 = tl ? ggml_moe_tl_now() : 0.0;
                 enum ggml_status ec = sched->cpu_async->join();
+                if (tl) {
+                    ggml_moe_tl_add(GGML_MOE_TL_CPU_JOIN, ggml_moe_tl_now() - t_cj0);
+                }
                 if (ec != GGML_STATUS_SUCCESS) {
                     return ec;
                 }
@@ -2027,10 +2044,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
+            const double t_ss0 = tl ? ggml_moe_tl_now() : 0.0;
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
                 ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
+            }
+            if (tl) {
+                ggml_moe_tl_add(GGML_MOE_TL_SPLIT_SYNC, ggml_moe_tl_now() - t_ss0);
             }
         }
 
@@ -2097,15 +2118,43 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // stream: this drain waits for that copy
                     ggml_moe_h2d_note_drain_after_slot();
                 }
-                // wait for the split backend to finish using the input before overwriting it
-                const double t_wait0 = ggml_moe_h2d_stats_enabled() ? ggml_moe_h2d_now() : 0.0;
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
+                // wait for the split backend to finish using the input before overwriting it.
+                //
+                // Round 16: this wait exists to stop the copy below from overwriting the
+                // staging mirror `input_cpy` while the previous split's matmul is still
+                // reading it. Without pipeline parallelism the scheduler has no events, so
+                // it is ggml_backend_synchronize -- the host blocked until the GPU has
+                // drained everything issued so far -- and decode pays it once per split
+                // input. When the residency policy handles this input there is no copy:
+                // the admission writes the persistent pack on the compute stream, which is
+                // already ordered against that matmul, and the staging mirror is never
+                // touched. Then the wait protects nothing and only serialises the host
+                // against the GPU. GGML_MOE_SKIP_STAGING_WAIT=1 drops it in exactly that
+                // case; the predicate is the policy's own entry condition, asked early.
+                const bool moe_will_handle =
+                    split->graph.n_nodes > 0 &&
+                    ggml_moe_cache_will_handle(input, split->graph.nodes[0],
+                                               split->graph.nodes[0]->src[2]);
+                static int skip_staging_wait = -1;
+                if (skip_staging_wait < 0) {
+                    const char * ev = getenv("GGML_MOE_SKIP_STAGING_WAIT");
+                    skip_staging_wait = ev ? atoi(ev) : 0;
+                }
+                const double t_wait0 = (ggml_moe_h2d_stats_enabled() || tl) ? ggml_moe_h2d_now() : 0.0;
+                if (!(moe_will_handle && skip_staging_wait)) {
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
                 }
                 if (ggml_moe_h2d_stats_enabled()) {
                     ggml_moe_h2d_add(GGML_MOE_H2D_WAIT_PREV, ggml_moe_h2d_now() - t_wait0);
+                }
+                if (tl) {
+                    ggml_moe_tl_add(moe_will_handle ? GGML_MOE_TL_INPUT_WAIT_MOE
+                                                    : GGML_MOE_TL_INPUT_WAIT,
+                                    ggml_moe_tl_now() - t_wait0);
                 }
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
@@ -2146,12 +2195,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
 
                     if (ids_tensor != prev_ids_tensor) {
-                        const double t_ids0 = ggml_moe_h2d_stats_enabled() ? ggml_moe_h2d_now() : 0.0;
+                        const double t_ids0 = (ggml_moe_h2d_stats_enabled() || tl) ? ggml_moe_h2d_now() : 0.0;
                         ids.resize(ggml_nbytes(ids_tensor) / sizeof(int32_t));
                         ggml_backend_tensor_get_async(ids_backend, ids_tensor, ids.data(), 0, ggml_nbytes(ids_tensor));
                         ggml_backend_synchronize(ids_backend);
                         if (ggml_moe_h2d_stats_enabled()) {
                             ggml_moe_h2d_add(GGML_MOE_H2D_IDS, ggml_moe_h2d_now() - t_ids0);
+                        }
+                        if (tl) {
+                            ggml_moe_tl_add(GGML_MOE_TL_IDS_READBACK, ggml_moe_tl_now() - t_ids0);
                         }
 
                         // find the used experts
@@ -2271,17 +2323,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // the pageable copies below read warm page cache instead of faulting
                         // one page at a time on this thread. 512 covers the padding read past
                         // the last expert of each run by copy_experts.
-                        const double t_pf0 = ggml_moe_h2d_stats_enabled() ? ggml_moe_h2d_now() : 0.0;
+                        const double t_pf0 = (ggml_moe_h2d_stats_enabled() || tl) ? ggml_moe_h2d_now() : 0.0;
                         ggml_moe_prefetch_mask(input, used_ids.data(), n_expert, 512);
                         ggml_moe_prefetch_wait(input);
                         if (ggml_moe_h2d_stats_enabled()) {
                             ggml_moe_h2d_add(GGML_MOE_H2D_PREFETCH, ggml_moe_h2d_now() - t_pf0);
                         }
+                        if (tl) {
+                            ggml_moe_tl_add(GGML_MOE_TL_PREFETCH_WAIT, ggml_moe_tl_now() - t_pf0);
+                        }
                     }
 
                     size_t stat_ranges = 0;
                     size_t stat_bytes  = 0;
-                    const double t_cpy0 = ggml_moe_h2d_stats_enabled() ? ggml_moe_h2d_now() : 0.0;
+                    const double t_cpy0 = (ggml_moe_h2d_stats_enabled() || tl) ? ggml_moe_h2d_now() : 0.0;
 
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
@@ -2389,6 +2444,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_moe_h2d_copy_done(stat_ranges, stat_bytes,
                                                input_cpy->data, ggml_nbytes(input_cpy));
                     }
+                    if (tl) {
+                        ggml_moe_tl_add(GGML_MOE_TL_STAGE_COPY, ggml_moe_tl_now() - t_cpy0);
+                    }
                 } else {
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
@@ -2412,7 +2470,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 sched->cpu_async->launch(split_backend, &split->graph);
                 continue;
             }
+            const double t_lau0 = tl ? ggml_moe_tl_now() : 0.0;
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
+            if (tl) {
+                ggml_moe_tl_add(GGML_MOE_TL_LAUNCH, ggml_moe_tl_now() - t_lau0);
+                tl_nodes += split->graph.n_nodes;
+            }
             if (split_prefetch_slot != -1) {
                 // the kernels have captured the slot address at launch, safe to restore
                 ggml_backend_event_record(sched->prefetch_free[split_prefetch_slot], split_backend);
@@ -2466,7 +2529,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     if (sched->cpu_async) {
+        const double t_cj0 = tl ? ggml_moe_tl_now() : 0.0;
         enum ggml_status ec = sched->cpu_async->join();
+        if (tl) {
+            ggml_moe_tl_add(GGML_MOE_TL_CPU_JOIN, ggml_moe_tl_now() - t_cj0);
+        }
         if (ec != GGML_STATUS_SUCCESS) {
             return ec;
         }
@@ -2474,6 +2541,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     if (ggml_moe_h2d_stats_enabled()) {
         ggml_moe_h2d_pass(ggml_moe_h2d_now() - t_pass0);
+    }
+    if (tl) {
+        ggml_moe_tl_pass_end(ggml_moe_tl_now() - t_tl0, sched->n_splits, tl_nodes);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -2715,6 +2785,8 @@ void ggml_backend_sched_set_async_cpu(ggml_backend_sched_t sched, bool enable) {
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    const int    tl    = ggml_moe_tl_enabled();
+    const double t_tl0 = tl ? ggml_moe_tl_now() : 0.0;
     if (sched->cpu_async) {
         sched->cpu_async->join();
     }
@@ -2729,6 +2801,9 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
         // this ensures that during generation the same copy is used every time,
         // which avoids changes in the graph that could cause CUDA or other graphs to be disabled
         sched->next_copy = 0;
+    }
+    if (tl) {
+        ggml_moe_tl_tail(ggml_moe_tl_now() - t_tl0);
     }
 }
 

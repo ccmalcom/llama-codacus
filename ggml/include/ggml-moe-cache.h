@@ -84,6 +84,14 @@ GGML_API void ggml_moe_cache_clear_registry(void);
 // derived from the identity map, so it holds this step's raw expert ids -- every draw,
 // hit or miss. Residency is decided against this module's own host-side mirror, not
 // against anything read back from the device.
+// Round 16, measurement and the optimisation it justified: the same decision as
+// ggml_moe_cache_admit's early returns, answerable *before* the scheduler waits for the
+// staging buffer. When this is true the staging copy never happens, so the wait that
+// protects the staging buffer protects nothing.
+GGML_API int ggml_moe_cache_will_handle(const struct ggml_tensor * host_weight,
+                               const struct ggml_tensor * node,
+                               const struct ggml_tensor * ids_tensor);
+
 GGML_API int ggml_moe_cache_admit(ggml_backend_t backend,
                          const struct ggml_tensor * host_weight,
                          const struct ggml_tensor * node,

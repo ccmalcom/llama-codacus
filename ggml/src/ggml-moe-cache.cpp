@@ -1,4 +1,5 @@
 #include "../include/ggml-moe-cache.h"
+#include "ggml-moe-timeline.h"
 #include "ggml-backend.h"
 #include "ggml-impl.h"
 
@@ -142,11 +143,9 @@ void ggml_moe_cache_begin_eval(void) {
 // the policy
 // ---------------------------------------------------------------------------
 
-int ggml_moe_cache_admit(ggml_backend_t backend,
-                         const ggml_tensor * host_weight,
-                         const ggml_tensor * node,
-                         ggml_tensor * ids_tensor,
-                         const int32_t * ids_host, int64_t n_ids) {
+int ggml_moe_cache_will_handle(const ggml_tensor * host_weight,
+                               const ggml_tensor * node,
+                               const ggml_tensor * ids_tensor) {
     registry & r = reg();
     if (!r.enabled || r.layers.empty()) {
         return 0;
@@ -160,7 +159,7 @@ int ggml_moe_cache_admit(ggml_backend_t backend,
     if (it == r.by_host.end()) {
         return 0;
     }
-    layer_state & st = r.layers[it->second.first];
+    const layer_state & st = r.layers[it->second.first];
     if (st.n_slots <= 0 || !st.map_hot || !st.map_cold || !st.map_ident) {
         return 0;
     }
@@ -171,12 +170,23 @@ int ggml_moe_cache_admit(ggml_backend_t backend,
     // on those mapped ids would admit the wrong experts and silence a cold chain that was
     // still carrying part of the layer. Checking provenance makes the two conditions the
     // same condition instead of two that merely usually agree.
-    {
-        const ggml_tensor * produced_by = ids_tensor->view_src ? ids_tensor->view_src : ids_tensor;
-        if (produced_by->op != GGML_OP_GET_ROWS || produced_by->src[0] != st.map_ident) {
-            return 0;
-        }
+    const ggml_tensor * produced_by = ids_tensor->view_src ? ids_tensor->view_src : ids_tensor;
+    if (produced_by->op != GGML_OP_GET_ROWS || produced_by->src[0] != st.map_ident) {
+        return 0;
     }
+    return 1;
+}
+
+int ggml_moe_cache_admit(ggml_backend_t backend,
+                         const ggml_tensor * host_weight,
+                         const ggml_tensor * node,
+                         ggml_tensor * ids_tensor,
+                         const int32_t * ids_host, int64_t n_ids) {
+    registry & r = reg();
+    if (!ggml_moe_cache_will_handle(host_weight, node, ids_tensor)) {
+        return 0;
+    }
+    layer_state & st = r.layers[r.by_host.find(host_weight)->second.first];
     // Every routed expert must be able to be resident at once, or "never evict an
     // expert routed this step" is unsatisfiable and the policy is unsound.
     if (n_ids <= 0 || n_ids > st.n_slots) {
@@ -194,6 +204,16 @@ int ggml_moe_cache_admit(ggml_backend_t backend,
         return 1;
     }
     st.decided_eval = r.eval;
+
+    // Round 16: reaching here *is* the batch-1 decode condition, established above by
+    // provenance rather than by ne[2] alone, so it is the right place to tell the
+    // timeline which phase this scheduler pass belongs to.
+    const int    tl    = ggml_moe_tl_enabled();
+    const double t_pol = tl ? ggml_moe_tl_now() : 0.0;
+    double       tl_dev = 0.0;   // device-call time inside the policy loop, subtracted below
+    if (tl) {
+        ggml_moe_tl_mark_decode();
+    }
 
     st.draw.assign(ids_host, ids_host + n_ids);
 
@@ -258,7 +278,21 @@ int ggml_moe_cache_admit(ggml_backend_t backend,
         // have moved, to a destination that survives the eval. No padding_end: the pack
         // is sized S*nb[2] exactly, op_params[0]=1 excludes MMQ, and the load-time fill
         // already writes unpadded slots.
-        for (int t = 0; t < 3; t++) {
+        // Round 16, phase 3: the near-zero-transfer reference. GGML_MOE_CACHE_NO_H2D=1
+        // runs the entire policy -- same decisions, same victims, same residency maps,
+        // same cold-chain silencing, same graph, same kernels, same launches -- and
+        // issues no expert bytes. The slots then hold whatever was there before, so the
+        // OUTPUT IS DELIBERATELY WRONG and no run taken with this set is a correctness
+        // result. It exists to measure what a decode token costs when the admission
+        // transfer is removed and nothing else is, which a regression intercept fitted
+        // across three arms can only infer.
+        static int no_h2d = -1;
+        if (no_h2d < 0) {
+            const char * ev = getenv("GGML_MOE_CACHE_NO_H2D");
+            no_h2d = ev ? atoi(ev) : 0;
+        }
+        const double t_w0 = tl ? ggml_moe_tl_now() : 0.0;
+        for (int t = 0; !no_h2d && t < 3; t++) {
             const ggml_tensor * src = st.host[t];
             ggml_tensor       * dst = st.pack[t];
             if (!src || !dst) {
@@ -270,12 +304,18 @@ int ggml_moe_cache_admit(ggml_backend_t backend,
                                           (size_t) victim * nb, nb);
             r.stats.bytes_h2d += (int64_t) nb;
         }
+        if (tl) {
+            const double dt = ggml_moe_tl_now() - t_w0;
+            ggml_moe_tl_add(GGML_MOE_TL_ADMIT_WEIGHTS, dt);
+            tl_dev += dt;
+        }
 
         // --- residency bookkeeping ---------------------------------------------
         // map_hot is the steering wheel: the graph's get_rows over it runs *after* this
         // point and turns these writes into the hot chain's slot ids. map_cold is kept
         // accurate in the same breath, because prefill still reads it and the two chains
         // are summed -- an expert present in both is added twice.
+        const double t_m0 = tl ? ggml_moe_tl_now() : 0.0;
         const int32_t minus_one = -1;
         if (evicted >= 0 && evicted < st.n_expert) {
             ggml_backend_tensor_set_async(backend, st.map_hot, &minus_one,
@@ -291,6 +331,12 @@ int ggml_moe_cache_admit(ggml_backend_t backend,
                                           (size_t) e * sizeof(int32_t), sizeof(int32_t));
             ggml_backend_tensor_set_async(backend, st.map_cold, &minus_one,
                                           (size_t) e * sizeof(int32_t), sizeof(int32_t));
+        }
+
+        if (tl) {
+            const double dt = ggml_moe_tl_now() - t_m0;
+            ggml_moe_tl_add(GGML_MOE_TL_ADMIT_MAPS, dt);
+            tl_dev += dt;
         }
 
         st.slot_owner[victim] = e;
@@ -323,11 +369,21 @@ int ggml_moe_cache_admit(ggml_backend_t backend,
     // is added twice: the chains are summed, and disjointness is what makes that a
     // reconstruction rather than a doubling. This write lands before the cold matmuls
     // consume it and before the hot get_rows overwrites the shared storage.
+    if (tl) {
+        // policy = everything this call did on the host minus the device calls already
+        // bucketed, so the admission buckets partition the call rather than overlap it
+        ggml_moe_tl_add(GGML_MOE_TL_ADMIT_POLICY, (ggml_moe_tl_now() - t_pol) - tl_dev);
+    }
+
+    const double t_i0 = tl ? ggml_moe_tl_now() : 0.0;
     if ((int64_t) st.minus1.size() != n_ids) {
         st.minus1.assign(n_ids, -1);
     }
     ggml_backend_tensor_set_async(backend, ids_tensor, st.minus1.data(), 0,
                                   n_ids * sizeof(int32_t));
+    if (tl) {
+        ggml_moe_tl_add(GGML_MOE_TL_ADMIT_IDS, ggml_moe_tl_now() - t_i0);
+    }
 
     static int dbg_left = -1;
     if (dbg_left < 0) {
