@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include "ggml-moe-cache.h"
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -2071,9 +2073,19 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (use_moe_packs) {
         ggml_tensor * ids_flat = ggml_cont_1d(ctx0, selected_experts, n_expert_used*n_tokens); // topk ids are a strided view
         ids_hot  = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->moe_map_hot,  ids_flat), n_expert_used, n_tokens);
-        ids_cold = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, moe_cache->moe_map_cold, ids_flat), n_expert_used, n_tokens);
+        // Round 15: at batch-1 decode under the dynamic policy the cold ids are derived
+        // from a permanent identity map, so the scheduler's existing readback of them is
+        // this step's raw routing -- which is what the policy needs and what get_rows
+        // over the real cold map destroys. The policy then overwrites them with -1
+        // before the cold matmuls run. Prefill keeps the real map and is untouched.
+        ggml_tensor * cold_map = moe_cache->moe_map_cold;
+        if (n_tokens == 1 && moe_cache->moe_map_ident && ggml_moe_cache_enabled()) {
+            cold_map = moe_cache->moe_map_ident;
+        }
+        ids_cold = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, cold_map, ids_flat), n_expert_used, n_tokens);
         cb(ids_hot,  "ffn_moe_ids_hot",  il);
         cb(ids_cold, "ffn_moe_ids_cold", il);
+
     }
 
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {

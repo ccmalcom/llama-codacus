@@ -14,6 +14,7 @@
 #include "ggml-impl.h"
 #include "ggml-moe-prefetch.h"
 #include "ggml-moe-h2d-stats.h"
+#include "ggml-moe-cache.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -1976,6 +1977,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     g_moe_dbg = ggml_moe_dbg_state();
     g_moe_dbg.eval     = g_moe_dbg_eval++;
+    ggml_moe_cache_begin_eval();
     g_moe_dbg.n_splits = sched->n_splits;
 
     if (sched->cpu_async) {
@@ -2191,6 +2193,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 // (moe-h2d, moe-route-digest, moe-host-prefetch) writes to
                                 // stderr for the same reason.
                                 g_moe_empty_packs++;
+                                // Round 15: under the dynamic residency policy an
+                                // all-resident layer is the designed steady state, not a
+                                // rarity, so this would print 48 times per token and
+                                // change the meaning of the counter again. Keep counting;
+                                // moe-cache reports it as empty_admits instead.
+                                if (!ggml_moe_cache_enabled())
                                 fprintf(stderr, "moe-decode: empty pack (nothing to copy) eval=%lld split=%d "
                                         "node='%s' batch=%lld weight='%s' n_expert=%lld ids=[%lld,%lld] "
                                         "total=%lld\n",
@@ -2243,6 +2251,18 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                 }
                             }
                         }
+                    }
+
+                    // Round 15: the dynamic residency policy. It consumes the routing
+                    // the readback above already produced, admits this step's misses
+                    // straight into their persistent pack slots -- the same bytes this
+                    // block would otherwise have staged -- and rewrites both id tensors.
+                    // When it handles the input there is nothing left to stage, so the
+                    // host prefetch and the whole selective-copy path below are skipped.
+                    if (ggml_moe_cache_admit(split_backend, input, node, ids_tensor,
+                                             ids.data(),
+                                             ids_tensor->ne[0] * ids_tensor->ne[1])) {
+                        continue;
                     }
 
                     if (sched->moe_host_prefetch) {

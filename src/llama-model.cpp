@@ -1,5 +1,7 @@
 #include "llama-model.h"
 
+#include "ggml-moe-cache.h"
+
 #include "llama-arch.h"
 #include "llama-ext.h"
 #include "llama-hparams.h"
@@ -1853,13 +1855,26 @@ void llama_model_base::init_moe_expert_cache() {
         const char * slots_env = getenv("GGML_MOE_CACHE_SLOTS");
         n_slots = slots_env ? atoi(slots_env) : 0;
     }
-    if (profile_path == nullptr || profile_path[0] == '\0' || n_slots <= 0) {
+    // Round 15: --moe-cache-policy as an env var, matching this tree's other MoE
+    // switches (GGML_MOE_HOST_PREFETCH, GGML_MOE_H2D_STATS). Under `lru` the pack's
+    // contents are decided per decode step by ggml-moe-cache instead of frozen here,
+    // and a profile becomes optional: cold-start LRU measured within 0.2 pp of the
+    // profile-seeded variant, so seeding buys nothing.
+    ggml_moe_cache_clear_registry();
+    const char * policy_env = getenv("GGML_MOE_CACHE_POLICY");
+    const bool lru = policy_env != nullptr && strcmp(policy_env, "lru") == 0;
+
+    if (n_slots <= 0) {
+        return;
+    }
+    const bool have_profile = profile_path != nullptr && profile_path[0] != '\0';
+    if (!have_profile && !lru) {
         return;
     }
 
     // routing profile: moe-trace CSV (pos,layer,id0,...), decode rows only
     std::map<int, std::map<int, int64_t>> freq; // layer -> expert -> count
-    {
+    if (have_profile) {
         FILE * f = fopen(profile_path, "r");
         if (!f) {
             LLAMA_LOG_WARN("%s: cannot open profile '%s' - expert cache disabled\n", __func__, profile_path);
@@ -1882,7 +1897,7 @@ void llama_model_base::init_moe_expert_cache() {
         }
         fclose(f);
     }
-    if (freq.empty()) {
+    if (freq.empty() && !lru) {
         LLAMA_LOG_WARN("%s: profile '%s' has no decode rows - expert cache disabled\n", __func__, profile_path);
         return;
     }
@@ -1901,7 +1916,7 @@ void llama_model_base::init_moe_expert_cache() {
     std::vector<int> pack_layers;
     for (int il = 0; il < (int) layers.size(); il++) {
         const auto & l = layers[il];
-        if (l.ffn_gate_exps && l.ffn_up_exps && l.ffn_down_exps && freq.count(il) &&
+        if (l.ffn_gate_exps && l.ffn_up_exps && l.ffn_down_exps && (lru || freq.count(il)) &&
             l.ffn_gate_exps->buffer && ggml_backend_buft_is_host(ggml_backend_buffer_get_type(l.ffn_gate_exps->buffer))) {
             pack_layers.push_back(il);
         }
@@ -1912,7 +1927,7 @@ void llama_model_base::init_moe_expert_cache() {
     }
 
     ggml_init_params ctx_params = {
-        /*.mem_size   =*/ (5*pack_layers.size() + 1)*ggml_tensor_overhead(),
+        /*.mem_size   =*/ (6*pack_layers.size() + 1)*ggml_tensor_overhead(),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -1930,11 +1945,13 @@ void llama_model_base::init_moe_expert_cache() {
         l.ffn_down_exps_hot = ggml_new_tensor_3d(ctx, d->type, d->ne[0], d->ne[1], S);
         l.moe_map_hot       = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
         l.moe_map_cold      = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
+        l.moe_map_ident     = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, 1, n_expert);
         ggml_format_name(l.ffn_gate_exps_hot, "blk.%d.ffn_gate_exps_hot", il);
         ggml_format_name(l.ffn_up_exps_hot,   "blk.%d.ffn_up_exps_hot",   il);
         ggml_format_name(l.ffn_down_exps_hot, "blk.%d.ffn_down_exps_hot", il);
         ggml_format_name(l.moe_map_hot,  "blk.%d.moe_map_hot",  il);
         ggml_format_name(l.moe_map_cold, "blk.%d.moe_map_cold", il);
+        ggml_format_name(l.moe_map_ident, "blk.%d.moe_map_ident", il);
     }
 
     ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
@@ -1944,7 +1961,7 @@ void llama_model_base::init_moe_expert_cache() {
         for (int il : pack_layers) {
             auto & l = layers[il];
             l.ffn_gate_exps_hot = l.ffn_up_exps_hot = l.ffn_down_exps_hot = nullptr;
-            l.moe_map_hot = l.moe_map_cold = nullptr;
+            l.moe_map_hot = l.moe_map_cold = l.moe_map_ident = nullptr;
         }
         return;
     }
@@ -1991,6 +2008,34 @@ void llama_model_base::init_moe_expert_cache() {
         }
         ggml_backend_tensor_set(l.moe_map_hot,  map_hot.data(),  0, n_expert*sizeof(int32_t));
         ggml_backend_tensor_set(l.moe_map_cold, map_cold.data(), 0, n_expert*sizeof(int32_t));
+        // identity: what the dynamic policy reads this step's raw routing through. Never
+        // written again after load.
+        {
+            std::vector<int32_t> ident(n_expert);
+            for (int64_t e = 0; e < n_expert; e++) { ident[e] = (int32_t) e; }
+            ggml_backend_tensor_set(l.moe_map_ident, ident.data(), 0, n_expert*sizeof(int32_t));
+        }
+
+        if (lru) {
+            // slot -> resident expert, matching the fill just performed. All -1 on a
+            // cold start; the policy then admits into free slots before it evicts.
+            std::vector<int32_t> owners(S, -1);
+            for (int64_t s = 0; s < S && s < (int64_t) ranked.size(); s++) {
+                owners[s] = ranked[s].second;
+            }
+            ggml_moe_cache_register_layer(il,
+                l.ffn_gate_exps, l.ffn_up_exps, l.ffn_down_exps,
+                l.ffn_gate_exps_hot, l.ffn_up_exps_hot, l.ffn_down_exps_hot,
+                l.moe_map_hot, l.moe_map_cold, l.moe_map_ident,
+                (int) S, (int) n_expert,
+                have_profile ? owners.data() : nullptr);
+        }
+    }
+
+    if (lru) {
+        ggml_moe_cache_set_enabled(1);
+        LLAMA_LOG_INFO("%s: expert cache policy: dynamic LRU, %d slots/layer, %s\n",
+            __func__, n_slots, have_profile ? "profile-seeded" : "cold start");
     }
 
     pimpl->ctxs_bufs.emplace_back(ggml_context_ptr{ctx}, std::vector<ggml_backend_buffer_ptr>{});

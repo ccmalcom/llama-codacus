@@ -205,6 +205,8 @@ add_library(ggml-base
             ggml-moe-prefetch.h
             ggml-moe-h2d-stats.cpp
             ggml-moe-h2d-stats.h
+            ggml-moe-cache.cpp
+            ../include/ggml-moe-cache.h
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h
