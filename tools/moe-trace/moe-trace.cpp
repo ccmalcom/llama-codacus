@@ -104,7 +104,12 @@ int main(int argc, char ** argv) {
     }
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    std::vector<llama_token> tokens = common_tokenize(lctx, params.prompt, true);
+    // parse_special=true: a deployed prompt is chat-templated, so <|im_start|>, <|im_end|>
+    // and <think> must become their own control tokens. With the default (false) they are
+    // tokenized as ordinary text and the same string comes out 98 tokens instead of the 76
+    // llama-server reports for it -- a different token stream, and therefore different
+    // routing, which is the one thing this tool exists to record faithfully.
+    std::vector<llama_token> tokens = common_tokenize(lctx, params.prompt, true, true);
     if (tokens.empty()) {
         LOG_ERR("empty prompt\n");
         return 1;
