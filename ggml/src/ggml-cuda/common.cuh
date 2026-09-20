@@ -1427,7 +1427,85 @@ struct ggml_backend_cuda_context {
 #ifdef USE_CUDA_GRAPH
     std::unordered_map<uint64_t, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
-    static const size_t max_cuda_graphs = 64;
+    // Round 17: the cache capacity is this round's single variable. The default is 64,
+    // unchanged; GGML_CUDA_MAX_GRAPHS overrides it, so a 64-vs-N A/B runs on one binary
+    // and the only difference between the two arms is this number.
+    static size_t max_graphs() {
+        static const size_t n = [] {
+            const char * e = getenv("GGML_CUDA_MAX_GRAPHS");
+            const int v = e ? atoi(e) : 0;
+            return v > 0 ? (size_t) v : (size_t) 64;
+        }();
+        return n;
+    }
+
+    // Round 17 diagnosis, opt-in with GGML_CUDA_GRAPH_STATS=1. Counters only: nothing
+    // here changes a decision. Round 16 measured 0 replays in 99,488 calls and inferred
+    // capacity churn from 193 keys against 64 slots. That inference has two competing
+    // explanations and these counters separate them: `evicted_return` (the key came back
+    // but its entry had been evicted, which capacity fixes) against `props_changed_dirty`
+    // (the entry survived and its node properties differed anyway, which capacity does not).
+    static bool graph_stats_enabled() {
+        static const bool on = [] {
+            const char * e = getenv("GGML_CUDA_GRAPH_STATS");
+            return e && atoi(e) > 0;
+        }();
+        return on;
+    }
+
+    struct graph_stats_t {
+        std::unordered_map<uint64_t, uint64_t> last_seen; // key -> compute ordinal
+        uint64_t computes            = 0;
+        uint64_t first_sighting      = 0;
+        uint64_t resident_return     = 0;
+        uint64_t evicted_return      = 0;
+        uint64_t insertions          = 0;
+        uint64_t evict_capacity      = 0;
+        uint64_t evict_sweep         = 0;
+        size_t   occupancy_max       = 0;
+        uint64_t compat_fail         = 0;
+        uint64_t uid_shortcut        = 0;
+        uint64_t props_changed_fresh = 0;
+        uint64_t props_changed_dirty = 0;
+        uint64_t props_stable        = 0;
+        uint64_t warmup_completed    = 0;
+        uint64_t warmup_reset        = 0;
+        uint64_t captures            = 0;
+        uint64_t replays             = 0;
+        // Reuse distance, in compute calls, between two sightings of one key. Each call
+        // touches exactly one key, so this is an upper bound on the LRU stack distance:
+        // a distance <= N proves a capacity of N would have kept that entry resident.
+        uint64_t rd_n = 0, rd_sum = 0, rd_max = 0;
+        uint64_t rd_le64 = 0, rd_le128 = 0, rd_le192 = 0, rd_le256 = 0, rd_le512 = 0, rd_gt512 = 0;
+    } gstats;
+
+    // Called once per ggml_backend_cuda_graph_compute, before any cuda_graph() lookup,
+    // because cuda_graph() itself both inserts and refreshes and so cannot observe
+    // whether the key was already resident on entry.
+    void graph_stats_note_entry(uint64_t graph_key) {
+        if (!graph_stats_enabled()) {
+            return;
+        }
+        gstats.computes++;
+        const bool resident = cuda_graphs.find(graph_key) != cuda_graphs.end();
+        auto seen = gstats.last_seen.find(graph_key);
+        if (seen == gstats.last_seen.end()) {
+            gstats.first_sighting++;
+        } else {
+            const uint64_t d = gstats.computes - seen->second;
+            gstats.rd_n++;
+            gstats.rd_sum += d;
+            gstats.rd_max = std::max(gstats.rd_max, d);
+            if      (d <=  64) { gstats.rd_le64++;  }
+            else if (d <= 128) { gstats.rd_le128++; }
+            else if (d <= 192) { gstats.rd_le192++; }
+            else if (d <= 256) { gstats.rd_le256++; }
+            else if (d <= 512) { gstats.rd_le512++; }
+            else               { gstats.rd_gt512++; }
+            if (resident) { gstats.resident_return++; } else { gstats.evicted_return++; }
+        }
+        gstats.last_seen[graph_key] = gstats.computes;
+    }
 
     int64_t last_graph_eviction_sweep = 0;
 
@@ -1440,6 +1518,7 @@ struct ggml_backend_cuda_context {
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
                 if (time_now - it->second->last_used_time >= 10'000'000) {
                     it = cuda_graphs.erase(it);
+                    gstats.evict_sweep++;
                 } else {
                     ++it;
                 }
@@ -1448,7 +1527,7 @@ struct ggml_backend_cuda_context {
 
         auto it = cuda_graphs.find(graph_key);
         if (it == cuda_graphs.end()) {
-            while (cuda_graphs.size() >= max_cuda_graphs) {
+            while (cuda_graphs.size() >= max_graphs()) {
                 auto lru = cuda_graphs.begin();
                 for (auto c = cuda_graphs.begin(); c != cuda_graphs.end(); ++c) {
                     if (c->second->last_used_time < lru->second->last_used_time) {
@@ -1456,8 +1535,11 @@ struct ggml_backend_cuda_context {
                     }
                 }
                 cuda_graphs.erase(lru);
+                gstats.evict_capacity++;
             }
             it = cuda_graphs.emplace(graph_key, std::make_unique<ggml_cuda_graph>()).first;
+            gstats.insertions++;
+            gstats.occupancy_max = std::max(gstats.occupancy_max, cuda_graphs.size());
         }
         it->second->last_used_time = time_now;
         return it->second.get();

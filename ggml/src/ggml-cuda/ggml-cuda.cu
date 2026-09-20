@@ -703,7 +703,17 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+#ifdef USE_CUDA_GRAPH
+static void ggml_cuda_graph_stats_report(ggml_backend_cuda_context * ctx, const char * when);
+#endif // USE_CUDA_GRAPH
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+#ifdef USE_CUDA_GRAPH
+    if (graph_stats_enabled() && gstats.computes > 0) {
+        ggml_cuda_graph_stats_report(this, "final");
+    }
+#endif // USE_CUDA_GRAPH
+
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
@@ -2576,6 +2586,107 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 }
 
 #ifdef USE_CUDA_GRAPH
+// Round 17, phase 2 refinement.
+//
+// The counters in common.cuh answer "did any key get evicted before its next sighting".
+// That is the wrong denominator for the capacity hypothesis: a call that fails the
+// MUL_MAT_ID sync gate can never replay at ANY capacity, so counting its evictions towards
+// capacity churn would overstate the case for raising the limit. These counters condition
+// residency and outcome on the call actually being graph-ELIGIBLE, and separately
+// characterise the gate itself.
+//
+// File-static rather than context members: this box has one CUDA device and one context,
+// and keeping them in this translation unit confines the rebuild to this file.
+struct r17_gate_stats_t {
+    uint64_t calls = 0, eligible = 0, ineligible = 0;
+
+    // MUL_MAT_ID gate, characterised rather than assumed
+    uint64_t calls_with_mmid = 0, mmid_nodes = 0;
+    uint64_t mmid_needs_sync = 0, mmid_sync_ids_skip = 0, mmid_sync_other = 0;
+    uint64_t calls_mmid_sync = 0;
+
+    // residency at call entry, conditioned on eligibility
+    uint64_t el_first = 0, el_resident = 0, el_evicted = 0;
+    uint64_t el_rd_le64 = 0, el_rd_le128 = 0, el_rd_le192 = 0, el_rd_le256 = 0, el_rd_gt256 = 0;
+    uint64_t el_rd_n = 0, el_rd_sum = 0, el_rd_max = 0;
+
+    // outcome, conditioned on eligibility
+    uint64_t el_props_stable = 0, el_props_fresh = 0, el_props_dirty = 0;
+    uint64_t el_replays = 0, el_captures = 0;
+
+    // eligible-only key population
+    std::unordered_map<uint64_t, uint64_t> el_last_seen;
+};
+static r17_gate_stats_t g_r17;
+
+// Round 17 report. `when` is "progress" for the periodic snapshots and "final" at teardown.
+// The two blocks answer different questions and must not be conflated: the `all calls`
+// block is every graph_compute, the `eligible` block is only those that passed the
+// MUL_MAT_ID sync gate and could therefore have replayed at some capacity.
+static void ggml_cuda_graph_stats_report(ggml_backend_cuda_context * ctx, const char * when) {
+    const ggml_backend_cuda_context::graph_stats_t & g = ctx->gstats;
+    const r17_gate_stats_t & r = g_r17;
+    const uint64_t returns    = g.resident_return + g.evicted_return;
+    const uint64_t el_returns = r.el_resident + r.el_evicted;
+
+    fprintf(stderr, "cuda-gs[%s]: capacity=%zu  computes=%" PRIu64 "  distinct_keys=%zu  occupancy_max=%zu\n",
+                  when, ggml_backend_cuda_context::max_graphs(), g.computes, g.last_seen.size(), g.occupancy_max);
+    fprintf(stderr, "cuda-gs[%s]: all calls: first=%" PRIu64 "  resident_return=%" PRIu64 "  evicted_return=%" PRIu64 " (%.1f%% of returns)\n",
+                  when, g.first_sighting, g.resident_return, g.evicted_return,
+                  returns ? 100.0 * g.evicted_return / returns : 0.0);
+    fprintf(stderr, "cuda-gs[%s]: cache: insertions=%" PRIu64 "  evict_capacity=%" PRIu64 "  evict_sweep=%" PRIu64 "\n",
+                  when, g.insertions, g.evict_capacity, g.evict_sweep);
+    fprintf(stderr, "cuda-gs[%s]: props: stable=%" PRIu64 "  changed_fresh=%" PRIu64 "  changed_dirty=%" PRIu64 "  uid_shortcut=%" PRIu64 "\n",
+                  when, g.props_stable, g.props_changed_fresh, g.props_changed_dirty, g.uid_shortcut);
+    fprintf(stderr, "cuda-gs[%s]: graph: warmup_done=%" PRIu64 "  warmup_reset=%" PRIu64 "  captures=%" PRIu64 "  replays=%" PRIu64 " (%.2f%% of computes)\n",
+                  when, g.warmup_completed, g.warmup_reset, g.captures, g.replays,
+                  g.computes ? 100.0 * g.replays / g.computes : 0.0);
+
+    // --- the gate, and the eligible-only denominator that the capacity question needs ---
+    fprintf(stderr, "cuda-gs[%s]: GATE: calls=%" PRIu64 "  eligible=%" PRIu64 " (%.1f%%)  ineligible=%" PRIu64 " (%.1f%%)\n",
+                  when, r.calls, r.eligible, r.calls ? 100.0 * r.eligible / r.calls : 0.0,
+                  r.ineligible, r.calls ? 100.0 * r.ineligible / r.calls : 0.0);
+    fprintf(stderr, "cuda-gs[%s]: GATE mul_mat_id: calls_with_mmid=%" PRIu64 "  calls_blocked_by_sync=%" PRIu64 "  nodes=%" PRIu64 "  needs_sync=%" PRIu64 " (ids_skip=%" PRIu64 ", other=%" PRIu64 ")\n",
+                  when, r.calls_with_mmid, r.calls_mmid_sync, r.mmid_nodes,
+                  r.mmid_needs_sync, r.mmid_sync_ids_skip, r.mmid_sync_other);
+    fprintf(stderr, "cuda-gs[%s]: ELIGIBLE residency: first=%" PRIu64 "  resident_return=%" PRIu64 "  evicted_return=%" PRIu64 " (%.1f%% of eligible returns)\n",
+                  when, r.el_first, r.el_resident, r.el_evicted,
+                  el_returns ? 100.0 * r.el_evicted / el_returns : 0.0);
+    fprintf(stderr, "cuda-gs[%s]: ELIGIBLE outcome: props_stable=%" PRIu64 "  props_fresh=%" PRIu64 "  props_dirty=%" PRIu64 "  captures=%" PRIu64 "  replays=%" PRIu64 "\n",
+                  when, r.el_props_stable, r.el_props_fresh, r.el_props_dirty, r.el_captures, r.el_replays);
+    fprintf(stderr, "cuda-gs[%s]: ELIGIBLE reuse distance (eligible calls): n=%" PRIu64 "  mean=%.1f  max=%" PRIu64 "  distinct_eligible_keys=%zu\n",
+                  when, r.el_rd_n, r.el_rd_n ? (double) r.el_rd_sum / r.el_rd_n : 0.0,
+                  r.el_rd_max, r.el_last_seen.size());
+    fprintf(stderr, "cuda-gs[%s]:   <=64: %" PRIu64 "   <=128: %" PRIu64 "   <=192: %" PRIu64 "   <=256: %" PRIu64 "   >256: %" PRIu64 "\n",
+                  when, r.el_rd_le64, r.el_rd_le128, r.el_rd_le192, r.el_rd_le256, r.el_rd_gt256);
+}
+
+// Walks the graph purely to count. Called only under GGML_CUDA_GRAPH_STATS=1, and it does
+// not feed any decision -- ggml_cuda_graph_check_compability below is left exactly as it
+// was, including its early break, so the gate under study is not perturbed by measuring it.
+static void r17_characterize_mmid(ggml_cgraph * cgraph) {
+    bool any_mmid = false, any_sync = false;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_cuda_is_view_or_noop(node) || node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+        any_mmid = true;
+        g_r17.mmid_nodes++;
+        if (ggml_cuda_mul_mat_id_needs_sync(node, cc)) {
+            any_sync = true;
+            g_r17.mmid_needs_sync++;
+            // op_params[0] != 0 is the hot/cold expert-pack split, i.e. the LRU cache.
+            // Separating it says whether the gate is closed BY the cache or independently.
+            if (node->op_params[0] != 0) { g_r17.mmid_sync_ids_skip++; }
+            else                         { g_r17.mmid_sync_other++;    }
+        }
+    }
+    if (any_mmid) { g_r17.calls_with_mmid++; }
+    if (any_sync) { g_r17.calls_mmid_sync++; }
+}
+
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
@@ -2644,13 +2755,19 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         cgraph->uid == graph->uid) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
+        cuda_ctx->gstats.uid_shortcut++;
         return false;
     }
 
     graph->uid = cgraph->uid;
 
+    // round 17: a fresh entry (new key, or one evicted since its last sighting) has no
+    // node_props at all, which is a different cause from an entry that survived and whose
+    // properties moved. Recorded before the resize erases the distinction.
+    const bool was_fresh = (int) graph->node_props.size() != cgraph->n_nodes;
+
     // Check if the graph size has changed
-    if ((int)graph->node_props.size() != cgraph->n_nodes) {
+    if (was_fresh) {
         res = true;
         graph->node_props.resize(cgraph->n_nodes);
     }
@@ -2671,6 +2788,14 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             graph->node_props[i] = prop;
             res = true;
         }
+    }
+
+    if (!res) {
+        cuda_ctx->gstats.props_stable++;
+    } else if (was_fresh) {
+        cuda_ctx->gstats.props_changed_fresh++;
+    } else {
+        cuda_ctx->gstats.props_changed_dirty++;
     }
 
     return res;
@@ -4471,18 +4596,60 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 #ifdef USE_CUDA_GRAPH
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
+    // round 17: before any lookup, because cuda_graph() inserts and refreshes and so
+    // cannot see whether this key was still resident when the call arrived
+    const bool r17_stats     = ggml_backend_cuda_context::graph_stats_enabled();
+    const bool r17_resident  = r17_stats && cuda_ctx->cuda_graphs.find(graph_key) != cuda_ctx->cuda_graphs.end();
+    cuda_ctx->graph_stats_note_entry(graph_key);
+    if (r17_stats) {
+        g_r17.calls++;
+        r17_characterize_mmid(cgraph);
+    }
+
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
     if (graph->is_enabled()) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
+        if (!graph_compatible) {
+            cuda_ctx->gstats.compat_fail++;
+        }
+        if (r17_stats) {
+            if (graph_compatible) {
+                g_r17.eligible++;
+                // residency, counted only over calls that could actually have replayed
+                auto prev = g_r17.el_last_seen.find(graph_key);
+                if (prev == g_r17.el_last_seen.end()) {
+                    g_r17.el_first++;
+                } else {
+                    const uint64_t d = g_r17.eligible - prev->second;
+                    g_r17.el_rd_n++; g_r17.el_rd_sum += d;
+                    g_r17.el_rd_max = std::max(g_r17.el_rd_max, d);
+                    if      (d <=  64) { g_r17.el_rd_le64++;  }
+                    else if (d <= 128) { g_r17.el_rd_le128++; }
+                    else if (d <= 192) { g_r17.el_rd_le192++; }
+                    else if (d <= 256) { g_r17.el_rd_le256++; }
+                    else               { g_r17.el_rd_gt256++; }
+                    if (r17_resident) { g_r17.el_resident++; } else { g_r17.el_evicted++; }
+                }
+                g_r17.el_last_seen[graph_key] = g_r17.eligible;
+            } else {
+                g_r17.ineligible++;
+            }
+        }
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            if (r17_stats) {
+                if (!properties_changed) { g_r17.el_props_stable++; }
+                else if (!r17_resident)  { g_r17.el_props_fresh++;  }
+                else                     { g_r17.el_props_dirty++;  }
+            }
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
                 if (!properties_changed) {
                     graph->warmup_complete = true;
+                    cuda_ctx->gstats.warmup_completed++;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
@@ -4493,6 +4660,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 if (properties_changed) {
                     // Properties changed - reset warmup, execute directly until stable again
                     graph->warmup_complete = false;
+                    cuda_ctx->gstats.warmup_reset++;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
                 } else {
                     use_cuda_graph = true;
@@ -4500,6 +4668,19 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                 }
             }
         }
+    }
+#endif // USE_CUDA_GRAPH
+
+#ifdef USE_CUDA_GRAPH
+    if (use_cuda_graph) {
+        if (cuda_graph_update_required) { cuda_ctx->gstats.captures++; g_r17.el_captures++; }
+        else                            { cuda_ctx->gstats.replays++;  g_r17.el_replays++;  }
+    }
+    // Periodic, because the destructor may not run on an abrupt shutdown, and because
+    // "does reuse stabilise over the run or keep churning" cannot be read off end-of-run
+    // totals. ~20k calls is about 100 decode tokens.
+    if (r17_stats && cuda_ctx->gstats.computes % 20000 == 0) {
+        ggml_cuda_graph_stats_report(cuda_ctx, "progress");
     }
 #endif // USE_CUDA_GRAPH
 
